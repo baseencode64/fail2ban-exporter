@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -24,7 +25,7 @@ var (
 			Name: "fail2ban_ip_banned",
 			Help: "IP ban status (1 - banned, 0 - unbanned)",
 		},
-		[]string{"ip", "jail"},
+		[]string{"ip", "jail", "lat", "lon"},
 	)
 	totalBannedIPsGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -56,9 +57,20 @@ var (
 var (
 	registry       = prometheus.NewRegistry()
 	ipRegex        = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
-	previousBanned = make(map[string]bool) // Ключ: "jail:ip"
+	previousBanned = make(map[string]bool)
 	lock           sync.Mutex
+
+	// Геокэш
+	geoCache      = make(map[string]geoCacheEntry)
+	geoCacheMutex sync.Mutex
+	apiClient     = &http.Client{Timeout: 5 * time.Second}
 )
+
+type geoCacheEntry struct {
+	Lat    string
+	Lon    string
+	Expiry time.Time
+}
 
 func init() {
 	registry.MustRegister(ipBannedGauge)
@@ -148,6 +160,46 @@ func getFail2BanVersion() {
 	}
 }
 
+func getGeoData(ip string) (lat, lon string) {
+	geoCacheMutex.Lock()
+	defer geoCacheMutex.Unlock()
+
+	// Проверка кэша
+	if entry, exists := geoCache[ip]; exists && time.Now().Before(entry.Expiry) {
+		return entry.Lat, entry.Lon
+	}
+
+	// Запрос к API
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=lat,lon", ip)
+	resp, err := apiClient.Get(url)
+	if err != nil {
+		log.Printf("ERROR: Failed to get geo data for %s: %v", ip, err)
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Lat float64 `json:"lat"`
+		Lon float64 `json:"lon"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("ERROR: Failed to parse geo data for %s: %v", ip, err)
+		return "", ""
+	}
+
+	latStr := fmt.Sprintf("%.4f", data.Lat)
+	lonStr := fmt.Sprintf("%.4f", data.Lon)
+
+	// Сохранение в кэш на 24 часа
+	geoCache[ip] = geoCacheEntry{
+		Lat:    latStr,
+		Lon:    lonStr,
+		Expiry: time.Now().Add(24 * time.Hour),
+	}
+
+	return latStr, lonStr
+}
+
 func collectFail2BanMetrics() {
 	exporterStatusGauge.Set(1)
 	getFail2BanVersion()
@@ -180,8 +232,11 @@ func collectFail2BanMetrics() {
 		for _, ip := range bannedIPs {
 			key := fmt.Sprintf("%s:%s", jail, ip)
 			currentBanned[key] = true
+
+			lat, lon := getGeoData(ip)
+
 			if !previousBanned[key] {
-				ipBannedGauge.WithLabelValues(ip, jail).Set(1)
+				ipBannedGauge.WithLabelValues(ip, jail, lat, lon).Set(1)
 			}
 		}
 		totalBanned += len(bannedIPs)
@@ -192,7 +247,16 @@ func collectFail2BanMetrics() {
 		if !currentBanned[key] {
 			parts := strings.SplitN(key, ":", 2)
 			jail, ip := parts[0], parts[1]
-			ipBannedGauge.WithLabelValues(ip, jail).Set(0)
+
+			// Получаем координаты из кэша
+			lat, lon := "", ""
+			geoCacheMutex.Lock()
+			if entry, exists := geoCache[ip]; exists {
+				lat, lon = entry.Lat, entry.Lon
+			}
+			geoCacheMutex.Unlock()
+
+			ipBannedGauge.WithLabelValues(ip, jail, lat, lon).Set(0)
 		}
 	}
 
